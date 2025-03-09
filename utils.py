@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 import pandas as pd
 
 
-class CodeData(Dataset): 
+class CodeDataset(Dataset): 
     def __init__(self, 
                  data: pd.DataFrame,   
                  is_filter: bool = True):

@@ -11,8 +11,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from fsdp_utils import  bfSixteen_policy
-from cycling_utils import TimestampedTimer
-from utils import CodeData
+from cycling_utils import TimestampedTimer, AtomicDirectory
+import utils
 
 import csv
 import functools
@@ -37,7 +37,7 @@ class Inference:
     }
     MODEL_NAME_SETME = "DeepSeek-R1-Distill-Llama-8B"
     DATA_PATH = f"/data/{MODEL_WEIGHT_IDS[MODEL_NAME_SETME]}"
-    OUTPUT_DIR = f"/root/isc-demos/output"
+    
 
     def __init__(self, 
                  data_path: str,
@@ -52,7 +52,8 @@ class Inference:
         self.world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(self.device_id)  # Enables calling 'cuda'
 
-        if self.is_master and not os.path.isdir(self.OUTPUT_DIR):
+        self.OUTPUT_DIR = f"/root/isc-demos/output"
+        if not os.path.isdir(self.OUTPUT_DIR):
             os.makedirs(self.OUTPUT_DIR)
         
         if self.device_id == 0: 
@@ -62,20 +63,23 @@ class Inference:
             self.timer.report(device_report)
         
         # Print device name
-        self.timer.report(f'Rank {self.rank}: Name: {torch.cuda.get_device_name(self.device_id)}')
+        self.timer.report(f'Rank {self.device_id}: Name: {torch.cuda.get_device_name(self.device_id)}')
         
         # Get the train-test split
         key = 'level_1'
         dataset = load_dataset(data_path)
         data = dataset[key].to_pandas()
         train_indices = np.random.choice(len(data), size = int(0.95 * len(data)))
-        test_indices =  np.array([i for i in range(len(data)) if i not in train_indices])
+        valid_indices =  np.array([i for i in range(len(data)) if i not in train_indices])
 
-        train_dataset, test_dataset = CodeData(data.iloc[train_indices]), CodeData(data.iloc[test_indices])
+        train_dataset = utils.CodeDataset(data.iloc[train_indices]), 
+        valid_dataset  = utils.CodeDataset(data.iloc[valid_indices])
 
-        # sampler = DistributedSampler(dataset)
-        self.train_data_loader = DataLoader(train_dataset, self.BATCH_SIZE, shuffle = True)  
-        self.test_data_loader = DataLoader(test_dataset, self.BATCH_SIZE, shuffle = True)
+        train_sampler = DistributedSampler(train_dataset)
+        valid_sampler = DistributedSampler(valid_dataset)
+
+        self.train_data_loader = DataLoader(train_dataset, self.BATCH_SIZE, shuffle = True, sampler = train_sampler)  
+        self.test_data_loader = DataLoader(valid_dataset, self.BATCH_SIZE, shuffle = True, sampler = valid_sampler)
 
         self.R1_Input = """ 
             Task: You are an expert in CUDA optimization and PyTorch performance analysis. 
@@ -122,42 +126,39 @@ class Inference:
 
     def run(self):
         tokenizer = AutoTokenizer.from_pretrained(self.DATA_PATH)
-        # if self.rank == 0:
-        model = AutoModelForCausalLM.from_pretrained(
-            self.DATA_PATH, 
-            use_cache=False, 
-            torch_dtype=torch.bfloat16
-        ).to("cuda")
+        if self.rank == 0:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.DATA_PATH, 
+                use_cache=False, 
+                torch_dtype=torch.bfloat16
+            ).to("cuda")
 
-        #     print(f"Main rank {self.rank} model params on device: {set([p.data.device for p in model.parameters()])}")
-        # else:
-        #     with torch.device("meta"):
-        #         model = AutoModelForCausalLM.from_pretrained(
-        #             self.DATA_PATH, 
-        #             use_cache=False, 
-        #             torch_dtype=torch.bfloat16
-        #         )
-        #         print(f"Non-main rank {self.rank} model params on device: {set([p.data.device for p in model.parameters()])}")
+            print(f"Main rank {self.rank} model params on device: {set([p.data.device for p in model.parameters()])}")
+        else:
+            with torch.device("meta"):
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.DATA_PATH, 
+                    use_cache=False, 
+                    torch_dtype=torch.bfloat16
+                )
+                print(f"Non-main rank {self.rank} model params on device: {set([p.data.device for p in model.parameters()])}")
 
         # wrap model in FSDP
-        # my_auto_wrap_policy = functools.partial(
-        #     size_based_auto_wrap_policy, min_num_params=1_000
-        # )
-        # device_mesh = init_device_mesh("cuda", (self.world_size,))
-        # model = FSDP(model, 
-        #     auto_wrap_policy=my_auto_wrap_policy,
-        #     sharding_strategy=self.SHARD_STRATEGY,
-        #     mixed_precision=bfSixteen_policy,
-        #     cpu_offload=CPUOffload(offload_params=True),
-        #     device_id=torch.cuda.current_device(),
-        #     param_init_fn=lambda mod: mod.to_empty(device=torch.cuda.current_device(), recurse=False), # for init from 'meta' device
-        #     sync_module_states=True, # broadcast model weights from main rank
-        #     device_mesh=device_mesh
-        # )
-        # filename = os.path.join(self.OUTPUT_DIR, f"{self.device_id}__{torch.cuda.get_device_name(self.device_id)}.csv")
-
-
-        filename = os.path.join(self.OUTPUT_DIR, "train.csv")
+        my_auto_wrap_policy = functools.partial(
+            size_based_auto_wrap_policy, min_num_params=1_000
+        )
+        device_mesh = init_device_mesh("cuda", (self.world_size,))
+        model = FSDP(model, 
+            auto_wrap_policy=my_auto_wrap_policy,
+            sharding_strategy=self.SHARD_STRATEGY,
+            mixed_precision=bfSixteen_policy,
+            cpu_offload=CPUOffload(offload_params=True),
+            device_id=torch.cuda.current_device(),
+            param_init_fn=lambda mod: mod.to_empty(device=torch.cuda.current_device(), recurse=False), # for init from 'meta' device
+            sync_module_states=True, # broadcast model weights from main rank
+            device_mesh=device_mesh
+        )
+        filename = os.path.join(self.OUTPUT_DIR, f"{self.rank}__{torch.cuda.get_device_name(self.device_id)}_train.csv")
         fieldnames = ['Operation Name', 'Kernel Name', 'CUDA Code', 'Torch Code', 'Response Token', 'Answer Token']
         if os.path.isfile(filename):
             os.remove(filename)
@@ -195,16 +196,18 @@ class Inference:
                     }
      
             self.create_csv(filename, fieldnames, [row])
-            # self.timer.report(f'Rank : {self.rank} | Created a file after {i} steps')
+            self.timer.report(f'Rank : {self.rank} | Created a file after {i} steps')
 
-        self.timer.report("Training Done.")
-        # dist.barrier()
-        # dist.destroy_process_group()
-
+        self.timer.report("Generated Training Data")
         if os.path.isfile(filename):
             os.remove(filename)
 
-        filename = os.path.join(self.OUTPUT_DIR, "test.csv")
+
+
+
+
+
+        filename = os.path.join(self.OUTPUT_DIR, f"{self.rank}__{torch.cuda.get_device_name(self.device_id)}_test.csv")
         if os.path.isfile(filename):
             os.remove(filename)
         fieldnames = ['Operation Name', 'Kernel Name', 'CUDA Code', 'Torch Code', 'Response Token', 'Answer Token']
@@ -242,9 +245,12 @@ class Inference:
         
 
             self.create_csv(filename, fieldnames, [row])
-            # self.timer.report(f'Rank : {self.rank} | Created a file after {i} steps')
+            self.timer.report(f'Rank : {self.rank} | Created a file after {i} steps')
 
-        self.timer.report("Testing Done.")
+        self.timer.report("Generated Test Data")
+        dist.barrier()
+        dist.destroy_process_group()
+
         
 if __name__ == "__main__":
     inference = Inference("SakanaAI/AI-CUDA-Engineer-Archive", "level_1")
