@@ -1,0 +1,12 @@
+isc_project_id = "9cc21c47-9533-42be-a2b2-c135e04fd665"
+experiment_name = "deepseek-r1-llama-8b"
+gpus = 8
+compute_mode = "burst"
+dataset_id_list = ["38b32289-7d34-4c72-9546-9d480f676840"]
+command = '''
+source /root/.deepseek/bin/activate && 
+torchrun --nnodes=$NNODES --nproc-per-node=$N_PROC 
+--master_addr=$MASTER_ADDR --master_port=$MASTER_PORT --node_rank=$RANK 
+/root/isc-demos/deepseek/fsdp.py 
+--dataset-id 38b32289-7d34-4c72-9546-9d480f676840
+--chk-path $OUTPUT_PATH'''
